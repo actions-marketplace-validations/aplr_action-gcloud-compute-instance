@@ -7,6 +7,8 @@ import * as gcloud from "@google-github-actions/setup-cloud-sdk"
 import { getConfig } from "./config"
 import { createInstanceName } from "./util"
 import { createInstance, getInstanceTemplateUrl } from "./compute"
+import { backOff } from "exponential-backoff"
+import { Instance } from "./shared"
 
 // Do not listen to the linter - this can NOT be rewritten as an ES6 import statement.
 // eslint-disable-next-line import/no-commonjs,@typescript-eslint/no-var-requires
@@ -25,6 +27,44 @@ async function ensureGcloud(): Promise<void> {
       "Not authenticated with Google Cloud Platform. Authenticate using @google-github-actions/auth.",
     )
   }
+}
+
+async function createInstanceLogged(
+  instanceName: string,
+  templateUrl: string,
+  project: string,
+  zone: string,
+) {
+  try {
+    core.info(
+      `Creating instance ${instanceName} from template ${templateUrl}...`,
+    )
+    return await createInstance(instanceName, templateUrl, project, zone)
+  } catch (err) {
+    core.warning(
+      `Failed to create instance ${instanceName} from template ${templateUrl}`,
+    )
+    throw err
+  }
+}
+
+async function createInstanceWithRetry(
+  instanceName: string,
+  templateUrl: string,
+  project: string,
+  zone: string,
+  numOfAttempts: number,
+): Promise<Instance> {
+  return await backOff(
+    () => createInstanceLogged(instanceName, templateUrl, project, zone),
+    {
+      jitter: "full",
+      startingDelay: 10_000,
+      maxDelay: 300_000,
+      timeMultiple: 3,
+      numOfAttempts,
+    },
+  )
 }
 
 async function run(): Promise<void> {
@@ -49,22 +89,14 @@ async function run(): Promise<void> {
     // generate an instance name based on prefix and run id
     const instanceName = createInstanceName(
       config.namePrefix,
+      github.context.repo.owner,
       github.context.repo.repo,
       github.context.runId,
     )
 
-    core.info(`Creating instance ${instanceName} from template ${templateUrl}`)
-
-    // create the instance, wait for it to be ready or skip if async was requested
-    const instance = await core.group("Create Instance", () =>
-      createInstance(instanceName, templateUrl, config.project, config.zone),
-    )
-
-    // add instance details to output: ip, name, ...
-    core.setOutput("instance_name", instance.name)
-    core.setOutput("instance_ip", instance.ip)
-
-    core.info(`Instance ${instance.name} created with IP ${instance.ip}`)
+    // We set the instance state ahead of creating the instance. If the action
+    // is interrupted while creating the instance, we still want to be able to
+    // delete the instance, if it was created.
 
     // tell post to tear-down instance if requested
     core.saveState("auto-delete", config.autoDelete ? "true" : "false")
@@ -74,6 +106,23 @@ async function run(): Promise<void> {
       project: config.project,
       zone: config.zone,
     })
+
+    // create the instance, wait for it to be ready or skip if async was requested
+    const instance = await core.group("Create Instance", () =>
+      createInstanceWithRetry(
+        instanceName,
+        templateUrl,
+        config.project,
+        config.zone,
+        config.retryOnFailure ? config.retryCount : 1,
+      ),
+    )
+
+    // add instance details to output: ip, name, ...
+    core.setOutput("instance_name", instance.name)
+    core.setOutput("instance_ip", instance.ip)
+
+    core.info(`Instance ${instance.name} created with IP ${instance.ip}`)
   } catch (err) {
     const msg = utils.errorMessage(err)
     core.setFailed(`aplr/actions-gcloud-compute-instance failed with ${msg}`)
